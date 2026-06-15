@@ -1,2 +1,241 @@
 # GitCommitGenerator
-This is an AI Git commit message generator that supports custom APIs.
+
+GitCommitGenerator is an AI-powered Git commit message generator for
+OpenAI-compatible chat completion APIs.
+
+It detects staged changes first. If unstaged tracked files or untracked files are
+present, it asks whether to include all, none, or a selected subset in the
+commit message. Included files are staged only after the final commit
+confirmation.
+
+## Install
+
+```bash
+cargo install --path .
+```
+
+Or run from the repository:
+
+```bash
+cargo run -- --model gpt-5.4 --api-key "$GCG_API_KEY"
+```
+
+## Configuration
+
+Configuration is loaded from:
+
+```text
+~/.config/gitcommitgenerator/config.toml
+```
+
+CLI arguments override the config file. `api_key` and `model` are required
+unless supplied with `--api-key` / `--model` or environment variables.
+
+Example:
+
+```toml
+api_key = "sk-..."
+base_url = "http://127.0.0.1:3002"
+endpoint = "/chat/completions"
+model = "gpt-5.4"
+temperature = 0.2
+max_tokens = 512
+timeout_seconds = 120
+proxy = "http://127.0.0.1:7890"
+stage_all = true
+confirm = true
+dry_run = false
+include_unstaged = "ask" # ask, always, or never
+
+# Legacy alias for staged_diff_command. Prefer the explicit commands below.
+diff_command = "git diff --cached --stat && git diff --cached --binary --find-renames"
+staged_diff_command = "git diff --cached --stat && git diff --cached --binary --find-renames"
+unstaged_diff_command = "git diff --stat && git diff --binary --find-renames"
+untracked_diff_command = "git ls-files --others --exclude-standard | while IFS= read -r file; do printf '\\nUntracked file: %s\\n' \"$file\"; git diff --no-index -- /dev/null \"$file\" || true; done"
+unstaged_files_command = "git diff --name-only"
+untracked_files_command = "git ls-files --others --exclude-standard"
+
+# Inline prompt or prompt_file may be used. If omitted, the built-in prompt
+# follows GitHub commit message conventions.
+prompt = """
+Write a concise GitHub-style commit message from this diff.
+Return only the commit message.
+"""
+
+headers = [
+  "X-Custom-Header: value"
+]
+
+[commit]
+signoff = true
+no_verify = false
+amend = false
+allow_empty = false
+allow_empty_message = false
+author = "Example User <user@example.com>"
+cleanup = "strip"
+args = ["--trailer Reviewed-by=QA"]
+```
+
+Environment variables:
+
+```bash
+export GCG_API_KEY="sk-..."
+export GCG_MODEL="gpt-5.4"
+export GCG_BASE_URL="http://127.0.0.1:3002"
+export GCG_ENDPOINT="/chat/completions"
+export GCG_CONFIG="$HOME/.config/gitcommitgenerator/config.toml"
+```
+
+`OPENAI_API_KEY` is also accepted as a fallback for the API key.
+
+## Usage
+
+```bash
+gitcommitgenerator --model gpt-5.4 --api-key "$GCG_API_KEY"
+```
+
+Common options:
+
+```bash
+gitcommitgenerator \
+  --base-url http://127.0.0.1:3002 \
+  --model gpt-5.4 \
+  --api-key "$GCG_API_KEY" \
+  --signoff \
+  --no-verify
+```
+
+Skip confirmation and print the message without committing:
+
+```bash
+gitcommitgenerator --model gpt-5.4 --api-key "$GCG_API_KEY" --yes --dry-run
+```
+
+Use a custom prompt and staged diff command:
+
+```bash
+gitcommitgenerator \
+  --model gpt-5.4 \
+  --api-key "$GCG_API_KEY" \
+  --prompt-file ./commit-prompt.txt \
+  --staged-diff-command "git diff --cached --stat && git diff --cached"
+```
+
+Control whether unstaged tracked files and untracked files are included:
+
+```bash
+gitcommitgenerator --model gpt-5.4 --api-key "$GCG_API_KEY" --include-unstaged ask
+gitcommitgenerator --model gpt-5.4 --api-key "$GCG_API_KEY" --include-unstaged always
+gitcommitgenerator --model gpt-5.4 --api-key "$GCG_API_KEY" --include-unstaged never
+```
+
+Disable automatic staging:
+
+```bash
+gitcommitgenerator --model gpt-5.4 --api-key "$GCG_API_KEY" --no-stage-all
+```
+
+With `--no-stage-all`, extra files may still be used for message generation if
+you include them, but the tool will not automatically stage them before
+`git commit`.
+
+Pass extra `git commit` arguments:
+
+```bash
+gitcommitgenerator \
+  --model gpt-5.4 \
+  --api-key "$GCG_API_KEY" \
+  --commit-arg "--trailer Reviewed-by=QA"
+```
+
+## Commit behavior
+
+By default, the tool runs side-effect-free commands before the final commit
+confirmation:
+
+```bash
+git diff --cached --stat
+git diff --cached --binary --find-renames
+git diff --name-only
+git ls-files --others --exclude-standard
+```
+
+If unstaged or untracked files are found, the default `include_unstaged = "ask"`
+mode prompts:
+
+```text
+[Y/n/select files to add] Include unstaged and untracked files?
+```
+
+Use `Y` to include every unstaged/untracked file, `n` to ignore them, or
+`select files to add` to choose a subset. The selection UI lists files in reverse
+numeric order:
+
+```text
+:: 3 files...
+3  docs/readme.md
+2  src/lib.rs
+1  new.txt
+==> Files to exclude: (for example: "1 2 3", "1-3", "^4", or file names)
+==>
+```
+
+The selector starts with all listed files included. Enter numbers, ranges, or
+file-name fragments to exclude files; prefix a selector with `^` to re-include a
+file after a broader exclusion.
+
+If extra files are included, the tool also runs side-effect-free path-scoped diff
+commands before the LLM request:
+
+```bash
+git diff --stat -- <selected unstaged files>
+git diff --binary --find-renames -- <selected unstaged files>
+git diff --no-index -- /dev/null <selected untracked file>
+```
+
+The configured `unstaged_diff_command` and `untracked_diff_command` are used
+when `include_unstaged = "always"` includes every extra file. Interactive
+selection uses path-scoped Git commands so excluded files do not appear in the
+LLM prompt.
+
+Before the final commit confirmation, the default workflow does not mutate the
+repository. After the user confirms the generated commit message, included
+unstaged and untracked paths are staged with `git add -- <path>...` when
+`stage_all = true`, then the commit is created.
+
+The generated message is passed to:
+
+```bash
+git commit -m "<generated message>"
+```
+
+Supported named commit flags include:
+
+- `--amend`
+- `--no-amend`
+- `--signoff`
+- `--no-signoff`
+- `--no-verify`
+- `--verify`
+- `--allow-empty`
+- `--no-allow-empty`
+- `--allow-empty-message`
+- `--no-allow-empty-message`
+- `--author`
+- `--date`
+- `--cleanup`
+- `--gpg-sign`
+- `--commit-arg` for additional raw arguments
+
+If `git commit` fails with a simple recoverable error, such as an empty commit,
+an empty commit message, or unstaged changes while automatic staging is disabled,
+the tool asks whether to retry with the appropriate fix.
+
+## Development
+
+```bash
+cargo fmt
+cargo test
+cargo clippy --all-targets --all-features
+```
