@@ -12,7 +12,7 @@ use std::process::{Command, Output};
 use std::time::Duration;
 
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
-pub const DEFAULT_ENDPOINT: &str = "/chat/completions";
+pub const DEFAULT_ENDPOINT: &str = "/v1/chat/completions";
 pub const DEFAULT_STAGED_DIFF_COMMAND: &str =
     "git diff --cached --stat && git diff --cached --binary --find-renames";
 pub const DEFAULT_UNSTAGED_DIFF_COMMAND: &str =
@@ -24,18 +24,21 @@ done";
 pub const DEFAULT_UNSTAGED_FILES_COMMAND: &str = "git diff --name-only";
 pub const DEFAULT_UNTRACKED_FILES_COMMAND: &str = "git ls-files --others --exclude-standard";
 pub const DEFAULT_DIFF_COMMAND: &str = DEFAULT_STAGED_DIFF_COMMAND;
-pub const DEFAULT_PROMPT: &str = r#"You are an expert software engineer writing a Git commit message.
+pub const DEFAULT_PROMPT: &str = r#"Generate a clear commit message in English based only on the provided diff.
 
-Generate a concise commit message from the provided Git diff.
+Use Conventional Commits format for the subject when appropriate, such as "feat:",
+"fix:", "docs:", "style:", "refactor:", "test:", "chore:", or "perf:".
+Write the subject in the imperative mood, for example "fix: handle empty response".
+Keep the subject concise, preferably under 100 characters.
 
-Follow GitHub commit message conventions:
-- Use an imperative, present-tense subject line.
-- Keep the subject line at or under 72 characters when possible.
-- Do not end the subject with a period.
-- Add a blank line and body only when useful.
-- In the body, explain what changed and why.
-- Mention notable tests, migrations, or breaking changes when present.
-- Return only the commit message, without Markdown fences or commentary."#;
+After the subject, add a blank line and include a brief body when the diff contains
+meaningful details, multiple changes, or behavior changes. The body should explain
+what changed and why, using 1-3 concise bullet points or short sentences.
+
+Do not simply repeat the subject. Do not use personal pronouns such as "I" or
+"we". Do not end the subject with a period. Avoid vague messages like "update
+code", "fix bug", or "misc changes". Return only the commit message, without
+Markdown fences or commentary."#;
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
@@ -520,7 +523,7 @@ pub fn run(config: &AppConfig) -> Result<()> {
     let message = generate_commit_message(config, &changes.diff)?;
     println!("\n{}\n", message);
 
-    if config.confirm && !confirm("[Y/n] Commit with this message? ")? {
+    if config.confirm && !confirm("Commit with this message? [Y/n]")? {
         println!("Aborted.");
         return Ok(());
     }
@@ -630,7 +633,7 @@ fn prompt_extra_change_selection(
     untracked_paths: &[String],
 ) -> Result<ExtraChangeSelection> {
     loop {
-        print!("[Y/n/select files to add] Include unstaged and untracked files? ");
+        print!("Include unstaged and untracked files? [Y/n/select files to add]");
         io::stdout().flush().context("failed to flush stdout")?;
 
         let mut input = String::new();
@@ -906,7 +909,10 @@ pub fn generate_commit_message(config: &AppConfig, diff: &str) -> Result<String>
         }],
     };
 
-    let mut builder = client.post(url).bearer_auth(&config.api_key).json(&request);
+    let mut builder = client
+        .post(&url)
+        .bearer_auth(&config.api_key)
+        .json(&request);
 
     for header in &config.headers {
         let (name, value) = parse_header(header)?;
@@ -915,13 +921,22 @@ pub fn generate_commit_message(config: &AppConfig, diff: &str) -> Result<String>
 
     let response = builder.send().context("failed to call LLM API")?;
     let status = response.status();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
     let body = response.text().context("failed to read LLM response")?;
 
     if !status.is_success() {
-        bail!("LLM API request failed with {status}: {body}");
+        bail!(
+            "LLM API request failed\nURL: {url}\nStatus: {status}\nContent-Type: {}\nBody preview:\n{}",
+            content_type.as_deref().unwrap_or("<missing>"),
+            response_preview(&body)
+        );
     }
 
-    parse_commit_message(&body)
+    parse_commit_message_response(&body, &url, status.as_u16(), content_type.as_deref())
 }
 
 fn build_client(config: &AppConfig) -> Result<Client> {
@@ -933,8 +948,23 @@ fn build_client(config: &AppConfig) -> Result<Client> {
 }
 
 pub fn parse_commit_message(body: &str) -> Result<String> {
+    parse_commit_message_response(body, "<unknown>", 200, None)
+}
+
+pub fn parse_commit_message_response(
+    body: &str,
+    url: &str,
+    status: u16,
+    content_type: Option<&str>,
+) -> Result<String> {
     let parsed: ChatResponse =
-        serde_json::from_str(body).context("failed to parse LLM response as chat completion")?;
+        serde_json::from_str(body).map_err(|error| {
+            anyhow!(
+                "failed to parse LLM response as an OpenAI-compatible chat completion\nURL: {url}\nStatus: {status}\nContent-Type: {}\nParse error: {error}\nBody preview:\n{}\nHint: verify --base-url and --endpoint. For New API/OpenAI-compatible gateways, the endpoint is commonly /v1/chat/completions.",
+                content_type.unwrap_or("<missing>"),
+                response_preview(body)
+            )
+        })?;
     let content = parsed
         .choices
         .into_iter()
@@ -953,6 +983,19 @@ pub fn parse_commit_message(body: &str) -> Result<String> {
     Ok(content)
 }
 
+fn response_preview(body: &str) -> String {
+    const MAX_CHARS: usize = 600;
+    let mut preview = body.trim().chars().take(MAX_CHARS).collect::<String>();
+    if body.trim().chars().count() > MAX_CHARS {
+        preview.push_str("\n...<truncated>");
+    }
+    if preview.is_empty() {
+        "<empty body>".to_string()
+    } else {
+        preview
+    }
+}
+
 fn parse_header(header: &str) -> Result<(String, String)> {
     let (name, value) = header
         .split_once(':')
@@ -960,12 +1003,40 @@ fn parse_header(header: &str) -> Result<(String, String)> {
     Ok((name.trim().to_string(), value.trim().to_string()))
 }
 
-fn join_url(base_url: &str, endpoint: &str) -> String {
-    format!(
-        "{}/{}",
-        base_url.trim_end_matches('/'),
-        endpoint.trim_start_matches('/')
-    )
+pub fn join_url(base_url: &str, endpoint: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    let mut endpoint_segments: Vec<&str> = endpoint
+        .trim_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+
+    if endpoint_segments.is_empty() {
+        return base.to_string();
+    }
+
+    let base_segments: Vec<&str> = base
+        .split('/')
+        .skip(3)
+        .filter(|segment| !segment.is_empty())
+        .collect();
+
+    let overlap = overlapping_segment_count(&base_segments, &endpoint_segments);
+    endpoint_segments.drain(0..overlap);
+
+    if endpoint_segments.is_empty() {
+        base.to_string()
+    } else {
+        format!("{}/{}", base, endpoint_segments.join("/"))
+    }
+}
+
+fn overlapping_segment_count(base_segments: &[&str], endpoint_segments: &[&str]) -> usize {
+    let max_overlap = base_segments.len().min(endpoint_segments.len());
+    (1..=max_overlap)
+        .rev()
+        .find(|count| base_segments[base_segments.len() - count..] == endpoint_segments[..*count])
+        .unwrap_or(0)
 }
 
 pub fn build_commit_args(options: &CommitOptions, message: &str) -> Result<Vec<String>> {
@@ -1038,19 +1109,19 @@ fn commit_with_retries(config: &AppConfig, message: &str, staged_for_commit: boo
 
         match detect_commit_fix(&error, already_stage_all, &options) {
             Some(CommitFix::AllowEmpty) => {
-                if confirm("[Y/n] Retry with --allow-empty? ")? {
+                if confirm("Retry with --allow-empty? [Y/n]")? {
                     options.allow_empty = true;
                     continue;
                 }
             }
             Some(CommitFix::AllowEmptyMessage) => {
-                if confirm("[Y/n] Retry with --allow-empty-message? ")? {
+                if confirm("Retry with --allow-empty-message? [Y/n]")? {
                     options.allow_empty_message = true;
                     continue;
                 }
             }
             Some(CommitFix::StageAll) => {
-                if confirm("[Y/n] Stage all changes with git add -A and retry? ")? {
+                if confirm("Stage all changes with git add -A and retry? [Y/n]")? {
                     run_git(["add", "-A"])?;
                     already_stage_all = true;
                     continue;
@@ -1181,7 +1252,9 @@ args = ["--quiet"]
         ]))
         .unwrap();
 
-        assert!(config.prompt.contains("GitHub commit message conventions"));
+        assert!(config.prompt.contains("Conventional Commits"));
+        assert!(config.prompt.contains("fix: handle empty response"));
+        assert_eq!(config.endpoint, DEFAULT_ENDPOINT);
         assert_eq!(config.diff_command, DEFAULT_DIFF_COMMAND);
         assert_eq!(config.staged_diff_command, DEFAULT_STAGED_DIFF_COMMAND);
         assert_eq!(config.unstaged_diff_command, DEFAULT_UNSTAGED_DIFF_COMMAND);
@@ -1327,6 +1400,46 @@ allow_empty_message = true
         assert_eq!(
             parse_commit_message(body).unwrap(),
             "Add configurable commit generation"
+        );
+    }
+
+    #[test]
+    fn parse_error_includes_response_context_and_hint() {
+        let error = parse_commit_message_response(
+            "<!doctype html><title>New API</title>",
+            "http://127.0.0.1:3002/chat/completions",
+            200,
+            Some("text/html; charset=utf-8"),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("URL: http://127.0.0.1:3002/chat/completions"));
+        assert!(error.contains("Content-Type: text/html; charset=utf-8"));
+        assert!(error.contains("<!doctype html>"));
+        assert!(error.contains("/v1/chat/completions"));
+    }
+
+    #[test]
+    fn join_url_deduplicates_openai_style_suffixes() {
+        assert_eq!(
+            join_url("http://127.0.0.1:3002", "/v1/chat/completions"),
+            "http://127.0.0.1:3002/v1/chat/completions"
+        );
+        assert_eq!(
+            join_url("http://127.0.0.1:3002/v1", "/v1/chat/completions"),
+            "http://127.0.0.1:3002/v1/chat/completions"
+        );
+        assert_eq!(
+            join_url(
+                "http://127.0.0.1:3002/v1/chat/completions",
+                "/v1/chat/completions",
+            ),
+            "http://127.0.0.1:3002/v1/chat/completions"
+        );
+        assert_eq!(
+            join_url(DEFAULT_BASE_URL, DEFAULT_ENDPOINT),
+            "https://api.openai.com/v1/chat/completions"
         );
     }
 

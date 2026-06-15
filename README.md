@@ -36,7 +36,7 @@ Example:
 ```toml
 api_key = "sk-..."
 base_url = "http://127.0.0.1:3002"
-endpoint = "/chat/completions"
+endpoint = "/v1/chat/completions"
 model = "gpt-5.4"
 temperature = 0.2
 max_tokens = 512
@@ -56,9 +56,9 @@ unstaged_files_command = "git diff --name-only"
 untracked_files_command = "git ls-files --others --exclude-standard"
 
 # Inline prompt or prompt_file may be used. If omitted, the built-in prompt
-# follows GitHub commit message conventions.
+# follows Conventional Commits when appropriate.
 prompt = """
-Write a concise GitHub-style commit message from this diff.
+Generate a clear Conventional Commit-style message from this diff.
 Return only the commit message.
 """
 
@@ -77,13 +77,17 @@ cleanup = "strip"
 args = ["--trailer Reviewed-by=QA"]
 ```
 
+`base_url` may be either the gateway root or an OpenAI-style prefix such as
+`http://127.0.0.1:3002/v1`; the tool avoids duplicating path segments when
+joining it with `endpoint`.
+
 Environment variables:
 
 ```bash
 export GCG_API_KEY="sk-..."
 export GCG_MODEL="gpt-5.4"
 export GCG_BASE_URL="http://127.0.0.1:3002"
-export GCG_ENDPOINT="/chat/completions"
+export GCG_ENDPOINT="/v1/chat/completions"
 export GCG_CONFIG="$HOME/.config/gitcommitgenerator/config.toml"
 ```
 
@@ -165,7 +169,7 @@ If unstaged or untracked files are found, the default `include_unstaged = "ask"`
 mode prompts:
 
 ```text
-[Y/n/select files to add] Include unstaged and untracked files?
+Include unstaged and untracked files? [Y/n/select files to add]
 ```
 
 Use `Y` to include every unstaged/untracked file, `n` to ignore them, or
