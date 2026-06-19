@@ -24,6 +24,7 @@ done";
 pub const DEFAULT_UNSTAGED_FILES_COMMAND: &str = "git diff --name-only";
 pub const DEFAULT_UNTRACKED_FILES_COMMAND: &str = "git ls-files --others --exclude-standard";
 pub const DEFAULT_DIFF_COMMAND: &str = DEFAULT_STAGED_DIFF_COMMAND;
+const LARGE_BINARY_DELTA_THRESHOLD: u64 = 100_000;
 pub const DEFAULT_PROMPT: &str = r#"Generate a clear commit message in English based only on the provided diff.
 
 Use Conventional Commits format for the subject when appropriate, such as "feat:",
@@ -300,8 +301,10 @@ struct ChatChoice {
 
 #[derive(Debug, Deserialize)]
 struct ChatChoiceMessage {
-    content: String,
+    content: Option<String>,
 }
+
+const EMPTY_LLM_RESPONSE_RETRIES: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitFix {
@@ -592,9 +595,76 @@ pub fn collect_changes(config: &AppConfig) -> Result<ChangeSet> {
     }
 
     Ok(ChangeSet {
-        diff: parts.join("\n\n"),
+        diff: sanitize_diff_for_llm(&parts.join("\n\n")),
         included_unstaged_paths,
         included_untracked_paths,
+    })
+}
+
+fn sanitize_diff_for_llm(diff: &str) -> String {
+    let mut sanitized = String::new();
+    let mut current_section = String::new();
+
+    for line in diff.split_inclusive('\n') {
+        if line.starts_with("diff --git ") {
+            sanitized.push_str(&sanitize_diff_section(&current_section));
+            current_section.clear();
+        }
+
+        if current_section.is_empty() && !line.starts_with("diff --git ") {
+            sanitized.push_str(line);
+        } else {
+            current_section.push_str(line);
+        }
+    }
+
+    sanitized.push_str(&sanitize_diff_section(&current_section));
+    sanitized
+}
+
+fn sanitize_diff_section(section: &str) -> String {
+    if section.is_empty() || !should_omit_diff_section(section) {
+        return section.to_string();
+    }
+
+    format!(
+        "Edit file {} (large binary diff omitted)\n",
+        diff_section_file_path(section)
+    )
+}
+
+fn should_omit_diff_section(section: &str) -> bool {
+    section
+        .lines()
+        .any(|line| line == "GIT binary patch" || large_binary_delta_size(line).is_some())
+}
+
+fn large_binary_delta_size(line: &str) -> Option<u64> {
+    let size = line.strip_prefix("delta ")?.split_whitespace().next()?;
+    let size = size.parse::<u64>().ok()?;
+    (size >= LARGE_BINARY_DELTA_THRESHOLD).then_some(size)
+}
+
+fn diff_section_file_path(section: &str) -> String {
+    let Some(header) = section.lines().next() else {
+        return "<unknown>".to_string();
+    };
+
+    parse_diff_git_path(header).unwrap_or_else(|| "<unknown>".to_string())
+}
+
+fn parse_diff_git_path(header: &str) -> Option<String> {
+    let rest = header.strip_prefix("diff --git ")?;
+
+    if let Some((_, path)) = rest.rsplit_once(" b/") {
+        return Some(path.trim().trim_matches('"').to_string());
+    }
+
+    let parts = shell_words::split(rest).ok()?;
+    parts.get(1).and_then(|path| {
+        path.strip_prefix("b/")
+            .or_else(|| path.strip_prefix("a/"))
+            .map(ToOwned::to_owned)
     })
 }
 
@@ -919,24 +989,41 @@ pub fn generate_commit_message(config: &AppConfig, diff: &str) -> Result<String>
         builder = builder.header(name, value);
     }
 
-    let response = builder.send().context("failed to call LLM API")?;
-    let status = response.status();
-    let content_type = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(ToOwned::to_owned);
-    let body = response.text().context("failed to read LLM response")?;
+    let mut empty_response_error = None;
+    for attempt in 0..=EMPTY_LLM_RESPONSE_RETRIES {
+        let response = builder
+            .try_clone()
+            .context("failed to clone LLM API request for retry")?
+            .send()
+            .context("failed to call LLM API")?;
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned);
+        let body = response.text().context("failed to read LLM response")?;
 
-    if !status.is_success() {
-        bail!(
-            "LLM API request failed\nURL: {url}\nStatus: {status}\nContent-Type: {}\nBody preview:\n{}",
-            content_type.as_deref().unwrap_or("<missing>"),
-            response_preview(&body)
-        );
+        if !status.is_success() {
+            bail!(
+                "LLM API request failed\nURL: {url}\nStatus: {status}\nContent-Type: {}\nBody preview:\n{}",
+                content_type.as_deref().unwrap_or("<missing>"),
+                response_preview(&body)
+            );
+        }
+
+        match parse_commit_message_response(&body, &url, status.as_u16(), content_type.as_deref()) {
+            Ok(message) => return Ok(message),
+            Err(error) if is_empty_llm_response_error(&error) => {
+                if attempt == EMPTY_LLM_RESPONSE_RETRIES {
+                    empty_response_error = Some(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
     }
 
-    parse_commit_message_response(&body, &url, status.as_u16(), content_type.as_deref())
+    Err(empty_response_error.expect("empty LLM response retry loop must set final error"))
 }
 
 fn build_client(config: &AppConfig) -> Result<Client> {
@@ -972,6 +1059,7 @@ pub fn parse_commit_message_response(
         .ok_or_else(|| anyhow!("LLM response did not contain any choices"))?
         .message
         .content
+        .unwrap_or_default()
         .trim()
         .trim_matches('`')
         .trim()
@@ -981,6 +1069,10 @@ pub fn parse_commit_message_response(
         bail!("LLM returned an empty commit message");
     }
     Ok(content)
+}
+
+fn is_empty_llm_response_error(error: &anyhow::Error) -> bool {
+    error.to_string() == "LLM returned an empty commit message"
 }
 
 fn response_preview(body: &str) -> String {
@@ -1386,6 +1478,60 @@ allow_empty_message = true
     }
 
     #[test]
+    fn sanitizes_git_binary_patch_sections_for_llm() {
+        let diff = "Note.pdf | Bin 1 -> 2 bytes\nsrc/lib.rs | 1 +\n\n\
+diff --git a/Note.pdf b/Note.pdf\n\
+index 2e1a645..0dd5894 100644\n\
+GIT binary patch\n\
+delta 1089611\n\
+zc-mCEQ*@wB*9018;$&jmwrwX9n-e>kIC)}oV%xTD+qP{?\n\
+diff --git a/src/lib.rs b/src/lib.rs\n\
+index 1111111..2222222 100644\n\
+--- a/src/lib.rs\n\
++++ b/src/lib.rs\n\
+@@ -1 +1 @@\n\
+-old\n\
++new\n";
+
+        let sanitized = sanitize_diff_for_llm(diff);
+
+        assert!(sanitized.contains("Note.pdf | Bin 1 -> 2 bytes"));
+        assert!(sanitized.contains("Edit file Note.pdf"));
+        assert!(!sanitized.contains("GIT binary patch"));
+        assert!(!sanitized.contains("zc-mCEQ"));
+        assert!(sanitized.contains("diff --git a/src/lib.rs b/src/lib.rs"));
+        assert!(sanitized.contains("+new"));
+    }
+
+    #[test]
+    fn keeps_small_text_diff_sections_for_llm() {
+        let diff = "diff --git a/src/lib.rs b/src/lib.rs\n\
+index 1111111..2222222 100644\n\
+--- a/src/lib.rs\n\
++++ b/src/lib.rs\n\
+@@ -1 +1 @@\n\
+-old\n\
++new\n";
+
+        assert_eq!(sanitize_diff_for_llm(diff), diff);
+    }
+
+    #[test]
+    fn sanitizes_large_delta_sections_for_llm() {
+        let diff = "diff --git a/asset.bin b/asset.bin\n\
+index 1111111..2222222 100644\n\
+delta 100000\n\
+huge payload\n";
+
+        let sanitized = sanitize_diff_for_llm(diff);
+
+        assert_eq!(
+            sanitized,
+            "Edit file asset.bin (large binary diff omitted)\n"
+        );
+    }
+
+    #[test]
     fn parses_openai_compatible_chat_response() {
         let body = r#"{
             "choices": [
@@ -1401,6 +1547,32 @@ allow_empty_message = true
             parse_commit_message(body).unwrap(),
             "Add configurable commit generation"
         );
+    }
+
+    #[test]
+    fn missing_chat_message_content_is_empty_commit_message() {
+        let body = r#"{
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "index": 0,
+                    "message": {
+                        "role": "assistant"
+                    }
+                }
+            ]
+        }"#;
+
+        let error = parse_commit_message_response(
+            body,
+            "http://127.0.0.1:3002/v1/chat/completions",
+            200,
+            Some("application/json; charset=utf-8"),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert_eq!(error, "LLM returned an empty commit message");
     }
 
     #[test]
