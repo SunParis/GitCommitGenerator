@@ -1,6 +1,6 @@
 [package]
 name = "gitcommitgenerator"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 description = "AI-powered Git commit message generator with configurable OpenAI-compatible LLM support."
