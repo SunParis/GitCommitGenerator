@@ -24,7 +24,26 @@ done";
 pub const DEFAULT_UNSTAGED_FILES_COMMAND: &str = "git diff --name-only";
 pub const DEFAULT_UNTRACKED_FILES_COMMAND: &str = "git ls-files --others --exclude-standard";
 pub const DEFAULT_DIFF_COMMAND: &str = DEFAULT_STAGED_DIFF_COMMAND;
+pub const DEFAULT_MAX_INPUT_CHARS: usize = 500_000;
+pub const DEFAULT_MAX_FILE_CHARS: usize = 80_000;
 const LARGE_BINARY_DELTA_THRESHOLD: u64 = 100_000;
+const CHAT_MESSAGE_CHAR_LIMIT: usize = 10_485_760;
+const MIN_DIFF_BUDGET_CHARS: usize = 4_000;
+const DEFAULT_IGNORED_DIFF_PATHS: &[&str] = &[
+    "dist/**",
+    "build/**",
+    "coverage/**",
+    "target/**",
+    "*.map",
+    "*.min.js",
+    "*.min.css",
+];
+const DEFAULT_LOCKFILE_NAMES: &[&str] = &[
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "Cargo.lock",
+];
 pub const DEFAULT_PROMPT: &str = r#"Generate a clear commit message in English based only on the provided diff.
 
 Use Conventional Commits format for the subject when appropriate, such as "feat:",
@@ -85,6 +104,18 @@ pub struct Cli {
 
     #[arg(long, value_enum)]
     pub include_unstaged: Option<IncludeUnstagedMode>,
+
+    #[arg(long, env = "GCG_MAX_INPUT_CHARS")]
+    pub max_input_chars: Option<usize>,
+
+    #[arg(long, env = "GCG_MAX_FILE_CHARS")]
+    pub max_file_chars: Option<usize>,
+
+    #[arg(long, action = ArgAction::Set)]
+    pub include_lockfiles: Option<bool>,
+
+    #[arg(long)]
+    pub ignore_diff_path: Vec<String>,
 
     #[arg(long)]
     pub temperature: Option<f32>,
@@ -210,6 +241,10 @@ pub struct FileConfig {
     pub unstaged_files_command: Option<String>,
     pub untracked_files_command: Option<String>,
     pub include_unstaged: Option<IncludeUnstagedMode>,
+    pub max_input_chars: Option<usize>,
+    pub max_file_chars: Option<usize>,
+    pub include_lockfiles: Option<bool>,
+    pub ignore_diff_paths: Option<Vec<String>>,
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
     pub timeout_seconds: Option<u64>,
@@ -249,6 +284,10 @@ pub struct AppConfig {
     pub unstaged_files_command: String,
     pub untracked_files_command: String,
     pub include_unstaged: IncludeUnstagedMode,
+    pub max_input_chars: usize,
+    pub max_file_chars: usize,
+    pub include_lockfiles: bool,
+    pub ignore_diff_paths: Vec<String>,
     pub temperature: f32,
     pub max_tokens: u32,
     pub timeout_seconds: u64,
@@ -318,12 +357,44 @@ pub struct ChangeSet {
     pub diff: String,
     pub included_unstaged_paths: Vec<String>,
     pub included_untracked_paths: Vec<String>,
+    pub diff_report: DiffPreparationReport,
 }
 
 impl ChangeSet {
     fn has_included_extra_paths(&self) -> bool {
         !self.included_unstaged_paths.is_empty() || !self.included_untracked_paths.is_empty()
     }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DiffPreparationReport {
+    pub original_chars: usize,
+    pub prepared_chars: usize,
+    pub input_budget_chars: usize,
+    pub omitted_files: Vec<String>,
+    pub truncated_files: Vec<String>,
+    pub reached_input_budget: bool,
+}
+
+impl DiffPreparationReport {
+    fn was_summarized(&self) -> bool {
+        self.original_chars != self.prepared_chars
+            || !self.omitted_files.is_empty()
+            || !self.truncated_files.is_empty()
+            || self.reached_input_budget
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PreparedDiff {
+    content: String,
+    report: DiffPreparationReport,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DiffPart {
+    path: Option<String>,
+    text: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -431,6 +502,24 @@ pub fn resolve_config(cli: Cli) -> Result<AppConfig> {
             .include_unstaged
             .or(file.include_unstaged)
             .unwrap_or(IncludeUnstagedMode::Ask),
+        max_input_chars: resolve_char_limit(
+            cli.max_input_chars.or(file.max_input_chars),
+            DEFAULT_MAX_INPUT_CHARS,
+            "max_input_chars",
+        )?,
+        max_file_chars: resolve_char_limit(
+            cli.max_file_chars.or(file.max_file_chars),
+            DEFAULT_MAX_FILE_CHARS,
+            "max_file_chars",
+        )?,
+        include_lockfiles: cli
+            .include_lockfiles
+            .or(file.include_lockfiles)
+            .unwrap_or(false),
+        ignore_diff_paths: merge_vec(
+            file.ignore_diff_paths.unwrap_or_default(),
+            cli.ignore_diff_path,
+        ),
         temperature: cli.temperature.or(file.temperature).unwrap_or(0.2),
         max_tokens: cli.max_tokens.or(file.max_tokens).unwrap_or(512),
         timeout_seconds: cli.timeout_seconds.or(file.timeout_seconds).unwrap_or(120),
@@ -492,6 +581,17 @@ fn merge_vec<T>(mut file_values: Vec<T>, cli_values: Vec<T>) -> Vec<T> {
     file_values
 }
 
+fn resolve_char_limit(value: Option<usize>, fallback: usize, name: &str) -> Result<usize> {
+    let value = value.unwrap_or(fallback);
+    if value < MIN_DIFF_BUDGET_CHARS {
+        bail!("{name} must be at least {MIN_DIFF_BUDGET_CHARS}");
+    }
+    if value >= CHAT_MESSAGE_CHAR_LIMIT {
+        bail!("{name} must be less than the chat message limit of {CHAT_MESSAGE_CHAR_LIMIT}");
+    }
+    Ok(value)
+}
+
 fn resolve_prompt(
     cli_prompt: Option<String>,
     cli_prompt_file: Option<PathBuf>,
@@ -522,6 +622,7 @@ pub fn run(config: &AppConfig) -> Result<()> {
     if changes.diff.trim().is_empty() && !config.commit.allow_empty {
         bail!("no uncommitted changes detected");
     }
+    print_diff_preparation_report(&changes.diff_report);
 
     let message = generate_commit_message(config, &changes.diff)?;
     println!("\n{}\n", message);
@@ -559,6 +660,51 @@ pub fn stage_included_paths(changes: &ChangeSet) -> Result<()> {
     Ok(())
 }
 
+fn print_diff_preparation_report(report: &DiffPreparationReport) {
+    if !report.was_summarized() {
+        return;
+    }
+
+    eprintln!(
+        "Diff input summarized: {} chars -> {} chars (budget: {} chars).",
+        report.original_chars, report.prepared_chars, report.input_budget_chars
+    );
+
+    if !report.truncated_files.is_empty() {
+        eprintln!(
+            "Truncated {} large diff section(s): {}",
+            report.truncated_files.len(),
+            summarize_report_items(&report.truncated_files)
+        );
+    }
+
+    if !report.omitted_files.is_empty() {
+        eprintln!(
+            "Omitted {} diff section(s): {}",
+            report.omitted_files.len(),
+            summarize_report_items(&report.omitted_files)
+        );
+    }
+
+    if report.reached_input_budget {
+        eprintln!("Input budget was exhausted before all diff sections were included.");
+    }
+}
+
+fn summarize_report_items(items: &[String]) -> String {
+    const MAX_ITEMS: usize = 5;
+    let mut summary = items
+        .iter()
+        .take(MAX_ITEMS)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if items.len() > MAX_ITEMS {
+        summary.push_str(&format!(", ... and {} more", items.len() - MAX_ITEMS));
+    }
+    summary
+}
+
 pub fn collect_changes(config: &AppConfig) -> Result<ChangeSet> {
     let staged_diff = run_shell_command(&config.staged_diff_command)?;
     let unstaged_paths = run_lines_command(&config.unstaged_files_command)?;
@@ -594,11 +740,228 @@ pub fn collect_changes(config: &AppConfig) -> Result<ChangeSet> {
         }
     }
 
+    let raw_diff = parts.join("\n\n");
+    let sanitized_diff = sanitize_diff_for_llm(&raw_diff);
+    let prepared_diff = prepare_diff_for_llm(config, &sanitized_diff);
+
     Ok(ChangeSet {
-        diff: sanitize_diff_for_llm(&parts.join("\n\n")),
+        diff: prepared_diff.content,
         included_unstaged_paths,
         included_untracked_paths,
+        diff_report: prepared_diff.report,
     })
+}
+
+fn prepare_diff_for_llm(config: &AppConfig, diff: &str) -> PreparedDiff {
+    let original_chars = diff.chars().count();
+    let budget = config.max_input_chars.min(CHAT_MESSAGE_CHAR_LIMIT - 1);
+    let max_file_chars = config.max_file_chars.min(budget);
+    let mut remaining = budget;
+    let mut content = String::new();
+    let mut omitted_files = Vec::new();
+    let mut truncated_files = Vec::new();
+    let mut reached_input_budget = false;
+
+    for part in split_diff_parts(diff) {
+        let part_path = part.path.clone();
+        let path = part_path.as_deref();
+        let Some(prepared_part) = prepare_diff_part(
+            part,
+            path,
+            max_file_chars,
+            config.include_lockfiles,
+            &config.ignore_diff_paths,
+            &mut omitted_files,
+            &mut truncated_files,
+        ) else {
+            continue;
+        };
+
+        if prepared_part.trim().is_empty() {
+            continue;
+        }
+
+        let separator_chars = if content.is_empty() { 0 } else { 2 };
+        let prepared_chars = prepared_part.chars().count();
+        if prepared_chars + separator_chars <= remaining {
+            if !content.is_empty() {
+                content.push_str("\n\n");
+                remaining -= 2;
+            }
+            content.push_str(&prepared_part);
+            remaining -= prepared_chars;
+            continue;
+        }
+
+        reached_input_budget = true;
+        if let Some(path) = path {
+            omitted_files.push(format!(
+                "{} (omitted: remaining input budget {} chars)",
+                path, remaining
+            ));
+        } else {
+            omitted_files.push(format!(
+                "<metadata> (omitted: remaining input budget {} chars)",
+                remaining
+            ));
+        }
+        break;
+    }
+
+    if content.trim().is_empty() && !diff.trim().is_empty() {
+        content =
+            truncate_to_char_boundary(diff, budget, "\n[diff omitted: input budget exhausted]\n");
+        reached_input_budget = true;
+    }
+
+    let prepared_chars = content.chars().count();
+    PreparedDiff {
+        content,
+        report: DiffPreparationReport {
+            original_chars,
+            prepared_chars,
+            input_budget_chars: budget,
+            omitted_files,
+            truncated_files,
+            reached_input_budget,
+        },
+    }
+}
+
+fn prepare_diff_part(
+    part: DiffPart,
+    path: Option<&str>,
+    max_file_chars: usize,
+    include_lockfiles: bool,
+    ignore_diff_paths: &[String],
+    omitted_files: &mut Vec<String>,
+    truncated_files: &mut Vec<String>,
+) -> Option<String> {
+    if let Some(path) = path
+        && should_ignore_diff_path(path, include_lockfiles, ignore_diff_paths)
+    {
+        omitted_files.push(format!("{path} (ignored by diff input policy)"));
+        return Some(format!("Edit file {path} (diff omitted by input policy)"));
+    }
+
+    let text_chars = part.text.chars().count();
+    if text_chars <= max_file_chars {
+        return Some(part.text);
+    }
+
+    let path_label = path.unwrap_or("<metadata>");
+    truncated_files.push(format!(
+        "{} ({} chars -> {} chars)",
+        path_label, text_chars, max_file_chars
+    ));
+    Some(truncate_to_char_boundary(
+        &part.text,
+        max_file_chars,
+        &format!(
+            "\n[omitted: {path_label}, original diff was {text_chars} chars, exceeded per-file budget]\n"
+        ),
+    ))
+}
+
+fn split_diff_parts(diff: &str) -> Vec<DiffPart> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut current_path = None;
+
+    for line in diff.split_inclusive('\n') {
+        if line.starts_with("diff --git ") || line.starts_with("Untracked file: ") {
+            if !current.is_empty() {
+                parts.push(DiffPart {
+                    path: current_path.take(),
+                    text: current,
+                });
+                current = String::new();
+            }
+            current_path = parse_diff_part_path(line);
+        }
+
+        current.push_str(line);
+    }
+
+    if !current.is_empty() {
+        parts.push(DiffPart {
+            path: current_path,
+            text: current,
+        });
+    }
+
+    parts
+}
+
+fn parse_diff_part_path(line: &str) -> Option<String> {
+    if line.starts_with("diff --git ") {
+        return parse_diff_git_path(line);
+    }
+
+    line.strip_prefix("Untracked file: ")
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn should_ignore_diff_path(
+    path: &str,
+    include_lockfiles: bool,
+    ignore_diff_paths: &[String],
+) -> bool {
+    if !include_lockfiles && is_lockfile_path(path) {
+        return true;
+    }
+
+    DEFAULT_IGNORED_DIFF_PATHS
+        .iter()
+        .any(|pattern| path_matches_pattern(path, pattern))
+        || ignore_diff_paths
+            .iter()
+            .any(|pattern| path_matches_pattern(path, pattern))
+}
+
+fn is_lockfile_path(path: &str) -> bool {
+    let file_name = path.rsplit('/').next().unwrap_or(path);
+    DEFAULT_LOCKFILE_NAMES.contains(&file_name)
+}
+
+fn path_matches_pattern(path: &str, pattern: &str) -> bool {
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        return false;
+    }
+
+    if let Some(prefix) = pattern.strip_suffix("/**") {
+        let prefix = prefix.trim_end_matches('/');
+        return path == prefix || path.starts_with(&format!("{prefix}/"));
+    }
+
+    if let Some(suffix) = pattern.strip_prefix("*.") {
+        return path
+            .rsplit('/')
+            .next()
+            .unwrap_or(path)
+            .ends_with(&format!(".{suffix}"));
+    }
+
+    if let Some(suffix) = pattern.strip_prefix('*') {
+        return path.ends_with(suffix);
+    }
+
+    path == pattern || path.starts_with(&format!("{pattern}/"))
+}
+
+fn truncate_to_char_boundary(text: &str, max_chars: usize, marker: &str) -> String {
+    let marker_chars = marker.chars().count();
+    if marker_chars >= max_chars {
+        return marker.chars().take(max_chars).collect();
+    }
+
+    let keep_chars = max_chars.saturating_sub(marker_chars);
+    let mut truncated = text.chars().take(keep_chars).collect::<String>();
+    truncated.push_str(marker);
+    truncated
 }
 
 fn sanitize_diff_for_llm(diff: &str) -> String {
@@ -969,6 +1332,13 @@ pub fn generate_commit_message(config: &AppConfig, diff: &str) -> Result<String>
     let client = build_client(config)?;
     let url = join_url(&config.base_url, &config.endpoint);
     let user_content = format!("{}\n\nGit diff:\n{}", config.prompt, diff);
+    let user_content_chars = user_content.chars().count();
+    if user_content_chars >= CHAT_MESSAGE_CHAR_LIMIT {
+        bail!(
+            "LLM request is too large after diff summarization: {user_content_chars} chars; limit is {CHAT_MESSAGE_CHAR_LIMIT}. Reduce prompt size or max_input_chars."
+        );
+    }
+
     let request = ChatRequest {
         model: &config.model,
         temperature: config.temperature,
@@ -1276,6 +1646,37 @@ mod tests {
         Cli::parse_from(std::iter::once("gitcommitgenerator").chain(args.iter().copied()))
     }
 
+    fn base_test_config() -> AppConfig {
+        AppConfig {
+            api_key: "key".to_string(),
+            base_url: "http://127.0.0.1:3002".to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            model: "model".to_string(),
+            prompt: "prompt".to_string(),
+            diff_command: DEFAULT_STAGED_DIFF_COMMAND.to_string(),
+            staged_diff_command: DEFAULT_STAGED_DIFF_COMMAND.to_string(),
+            unstaged_diff_command: DEFAULT_UNSTAGED_DIFF_COMMAND.to_string(),
+            untracked_diff_command: DEFAULT_UNTRACKED_DIFF_COMMAND.to_string(),
+            unstaged_files_command: DEFAULT_UNSTAGED_FILES_COMMAND.to_string(),
+            untracked_files_command: DEFAULT_UNTRACKED_FILES_COMMAND.to_string(),
+            include_unstaged: IncludeUnstagedMode::Ask,
+            max_input_chars: DEFAULT_MAX_INPUT_CHARS,
+            max_file_chars: DEFAULT_MAX_FILE_CHARS,
+            include_lockfiles: false,
+            ignore_diff_paths: Vec::new(),
+            temperature: 0.2,
+            max_tokens: 512,
+            timeout_seconds: 120,
+            proxy: None,
+            headers: Vec::new(),
+            stage_all: true,
+            confirm: true,
+            assume_yes: false,
+            dry_run: false,
+            commit: CommitOptions::default(),
+        }
+    }
+
     #[test]
     fn cli_values_override_file_config() {
         let dir = tempdir().unwrap();
@@ -1363,8 +1764,63 @@ args = ["--quiet"]
             DEFAULT_UNTRACKED_FILES_COMMAND
         );
         assert_eq!(config.include_unstaged, IncludeUnstagedMode::Ask);
+        assert_eq!(config.max_input_chars, DEFAULT_MAX_INPUT_CHARS);
+        assert_eq!(config.max_file_chars, DEFAULT_MAX_FILE_CHARS);
+        assert!(!config.include_lockfiles);
+        assert!(config.ignore_diff_paths.is_empty());
         assert!(config.stage_all);
         assert!(config.confirm);
+    }
+
+    #[test]
+    fn resolves_diff_input_budget_config() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+api_key = "key"
+model = "model"
+max_input_chars = 12000
+max_file_chars = 6000
+include_lockfiles = true
+ignore_diff_paths = ["fixtures/**"]
+"#,
+        )
+        .unwrap();
+
+        let config = resolve_config(parse(&[
+            "--config",
+            config_path.to_str().unwrap(),
+            "--max-input-chars",
+            "20000",
+            "--ignore-diff-path",
+            "*.snap",
+        ]))
+        .unwrap();
+
+        assert_eq!(config.max_input_chars, 20_000);
+        assert_eq!(config.max_file_chars, 6_000);
+        assert!(config.include_lockfiles);
+        assert_eq!(config.ignore_diff_paths, vec!["fixtures/**", "*.snap"]);
+    }
+
+    #[test]
+    fn rejects_too_small_diff_input_budget() {
+        let error = resolve_config(parse(&[
+            "--config",
+            "/tmp/definitely-not-a-real-gcg-config.toml",
+            "--api-key",
+            "key",
+            "--model",
+            "model",
+            "--max-input-chars",
+            "3999",
+        ]))
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("max_input_chars must be at least"));
     }
 
     #[test]
@@ -1529,6 +1985,126 @@ huge payload\n";
             sanitized,
             "Edit file asset.bin (large binary diff omitted)\n"
         );
+    }
+
+    #[test]
+    fn omits_lockfiles_and_generated_diff_sections_by_default() {
+        let mut config = base_test_config();
+        config.max_input_chars = 12_000;
+        config.max_file_chars = 8_000;
+        let diff = "diff --git a/src/lib.rs b/src/lib.rs\n\
+index 1111111..2222222 100644\n\
+--- a/src/lib.rs\n\
++++ b/src/lib.rs\n\
+@@ -1 +1 @@\n\
+-old\n\
++new\n\
+diff --git a/Cargo.lock b/Cargo.lock\n\
+index 1111111..2222222 100644\n\
+--- a/Cargo.lock\n\
++++ b/Cargo.lock\n\
+@@ -1 +1 @@\n\
+-old lock\n\
++new lock\n\
+diff --git a/dist/app.js b/dist/app.js\n\
+index 1111111..2222222 100644\n\
+--- a/dist/app.js\n\
++++ b/dist/app.js\n\
+@@ -1 +1 @@\n\
+-old bundle\n\
++new bundle\n";
+
+        let prepared = prepare_diff_for_llm(&config, diff);
+
+        assert!(prepared.content.contains("+new"));
+        assert!(
+            prepared
+                .content
+                .contains("Cargo.lock (diff omitted by input policy)")
+        );
+        assert!(
+            prepared
+                .content
+                .contains("dist/app.js (diff omitted by input policy)")
+        );
+        assert!(!prepared.content.contains("+new lock"));
+        assert!(!prepared.content.contains("+new bundle"));
+        assert_eq!(prepared.report.omitted_files.len(), 2);
+    }
+
+    #[test]
+    fn can_include_lockfiles_when_configured() {
+        let mut config = base_test_config();
+        config.include_lockfiles = true;
+        config.max_input_chars = 12_000;
+        config.max_file_chars = 8_000;
+        let diff = "diff --git a/Cargo.lock b/Cargo.lock\n\
+index 1111111..2222222 100644\n\
+--- a/Cargo.lock\n\
++++ b/Cargo.lock\n\
+@@ -1 +1 @@\n\
+-old lock\n\
++new lock\n";
+
+        let prepared = prepare_diff_for_llm(&config, diff);
+
+        assert!(prepared.content.contains("+new lock"));
+        assert!(prepared.report.omitted_files.is_empty());
+    }
+
+    #[test]
+    fn truncates_large_diff_sections_to_per_file_budget() {
+        let mut config = base_test_config();
+        config.max_input_chars = 12_000;
+        config.max_file_chars = 4_200;
+        let large_payload = "x".repeat(8_000);
+        let diff = format!(
+            "diff --git a/src/large.rs b/src/large.rs\n\
+index 1111111..2222222 100644\n\
+--- a/src/large.rs\n\
++++ b/src/large.rs\n\
+@@ -1 +1 @@\n\
+-old\n\
++{large_payload}\n"
+        );
+
+        let prepared = prepare_diff_for_llm(&config, &diff);
+
+        assert!(prepared.content.chars().count() <= 4_200);
+        assert!(prepared.content.contains("exceeded per-file budget"));
+        assert_eq!(prepared.report.truncated_files.len(), 1);
+    }
+
+    #[test]
+    fn stops_adding_sections_when_input_budget_is_exhausted() {
+        let mut config = base_test_config();
+        config.max_input_chars = 4_500;
+        config.max_file_chars = 4_200;
+        let first_payload = "a".repeat(3_600);
+        let second_payload = "b".repeat(3_600);
+        let diff = format!(
+            "diff --git a/src/one.rs b/src/one.rs\n\
+index 1111111..2222222 100644\n\
+--- a/src/one.rs\n\
++++ b/src/one.rs\n\
+@@ -1 +1 @@\n\
+-old\n\
++{first_payload}\n\
+diff --git a/src/two.rs b/src/two.rs\n\
+index 1111111..2222222 100644\n\
+--- a/src/two.rs\n\
++++ b/src/two.rs\n\
+@@ -1 +1 @@\n\
+-old\n\
++{second_payload}\n"
+        );
+
+        let prepared = prepare_diff_for_llm(&config, &diff);
+
+        assert!(prepared.content.contains("src/one.rs"));
+        assert!(!prepared.content.contains("src/two.rs"));
+        assert!(prepared.report.reached_input_budget);
+        assert_eq!(prepared.report.omitted_files.len(), 1);
     }
 
     #[test]

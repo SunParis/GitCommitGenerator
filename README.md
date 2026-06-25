@@ -46,6 +46,10 @@ stage_all = true
 confirm = true
 dry_run = false
 include_unstaged = "ask" # ask, always, or never
+max_input_chars = 500000
+max_file_chars = 80000
+include_lockfiles = false
+ignore_diff_paths = ["fixtures/**", "*.snap"]
 
 # Legacy alias for staged_diff_command. Prefer the explicit commands below.
 diff_command = "git diff --cached --stat && git diff --cached --binary --find-renames"
@@ -81,6 +85,19 @@ args = ["--trailer Reviewed-by=QA"]
 `http://127.0.0.1:3002/v1`; the tool avoids duplicating path segments when
 joining it with `endpoint`.
 
+Diff input controls:
+
+| Config key | CLI option | Default | Description |
+| --- | --- | --- | --- |
+| `max_input_chars` | `--max-input-chars` | `500000` | Maximum characters from the prepared diff that can be sent in the LLM request. Must be at least `4000` and below the chat message limit. |
+| `max_file_chars` | `--max-file-chars` | `80000` | Maximum characters kept from one diff section before it is truncated with an omission marker. |
+| `include_lockfiles` | `--include-lockfiles true/false` | `false` | Include lock file diffs in full instead of summarizing them. |
+| `ignore_diff_paths` | `--ignore-diff-path` | `[]` | Extra path patterns to summarize instead of sending in full. Repeat the CLI flag for multiple patterns. |
+
+Supported `ignore_diff_paths` patterns are intentionally simple: exact paths,
+directory prefixes such as `fixtures/**`, extension-style patterns such as
+`*.snap`, and suffix patterns such as `*generated.json`.
+
 Environment variables:
 
 ```bash
@@ -89,6 +106,8 @@ export GCG_MODEL="gpt-5.4"
 export GCG_BASE_URL="http://127.0.0.1:3002"
 export GCG_ENDPOINT="/v1/chat/completions"
 export GCG_CONFIG="$HOME/.config/gitcommitgenerator/config.toml"
+export GCG_MAX_INPUT_CHARS="500000"
+export GCG_MAX_FILE_CHARS="80000"
 ```
 
 `OPENAI_API_KEY` is also accepted as a fallback for the API key.
@@ -132,6 +151,18 @@ Control whether unstaged tracked files and untracked files are included:
 gitcommitgenerator --model gpt-5.4 --api-key "$GCG_API_KEY" --include-unstaged ask
 gitcommitgenerator --model gpt-5.4 --api-key "$GCG_API_KEY" --include-unstaged always
 gitcommitgenerator --model gpt-5.4 --api-key "$GCG_API_KEY" --include-unstaged never
+```
+
+Control diff input size for large commits:
+
+```bash
+gitcommitgenerator \
+  --model gpt-5.4 \
+  --api-key "$GCG_API_KEY" \
+  --max-input-chars 500000 \
+  --max-file-chars 80000 \
+  --include-lockfiles false \
+  --ignore-diff-path "fixtures/**"
 ```
 
 Disable automatic staging:
@@ -202,6 +233,51 @@ The configured `unstaged_diff_command` and `untracked_diff_command` are used
 when `include_unstaged = "always"` includes every extra file. Interactive
 selection uses path-scoped Git commands so excluded files do not appear in the
 LLM prompt.
+
+## Diff input limits
+
+Before calling the LLM, the collected diff is sanitized and constrained by an
+input budget. This prevents OpenAI-compatible gateways from rejecting the
+request because one chat message is too large.
+
+The tool first removes large Git binary patch payloads. It then splits the diff
+into file-level sections, applies path policy, truncates sections above
+`max_file_chars`, and stops adding sections once `max_input_chars` is exhausted.
+If the final prompt still exceeds the hard chat message limit of `10485760`
+characters, the request is rejected locally with a clear error instead of
+sending a doomed API call.
+
+By default, these paths are summarized instead of sent in full:
+
+- lock files: `package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`, `Cargo.lock`
+- generated directories: `dist/**`, `build/**`, `coverage/**`, `target/**`
+- generated/minified files: `*.map`, `*.min.js`, `*.min.css`
+
+Set `include_lockfiles = true` or pass `--include-lockfiles true` to keep lock
+file diffs. Add project-specific generated files with `ignore_diff_paths` or
+repeated `--ignore-diff-path` flags.
+
+Summarized sections remain visible to the model as file-level markers such as:
+
+```text
+Edit file Cargo.lock (diff omitted by input policy)
+[omitted: src/large.rs, original diff was 90000 chars, exceeded per-file budget]
+```
+
+If the diff has to be summarized, the tool prints a short report before the LLM
+request:
+
+```text
+Diff input summarized: 24355202 chars -> 500000 chars (budget: 500000 chars).
+Truncated 3 large diff section(s): src/large.rs (90000 chars -> 80000 chars)
+Omitted 8 diff section(s): Cargo.lock (ignored by diff input policy), ...
+```
+
+For very large commits, prefer excluding generated output or lowering
+`max_file_chars` rather than raising `max_input_chars` close to the gateway
+limit. Commit messages are usually better when the prompt contains a compact
+summary of representative source changes instead of megabytes of repeated
+generated content.
 
 Before the final commit confirmation, the default workflow does not mutate the
 repository. After the user confirms the generated commit message, included

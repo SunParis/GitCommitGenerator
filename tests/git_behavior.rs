@@ -1,7 +1,8 @@
 use gitcommitgenerator::{
-    AppConfig, ChangeSet, CommitFix, CommitOptions, DEFAULT_STAGED_DIFF_COMMAND,
-    DEFAULT_UNSTAGED_DIFF_COMMAND, DEFAULT_UNTRACKED_DIFF_COMMAND, IncludeUnstagedMode,
-    build_commit_args, collect_changes, detect_commit_fix, run_shell_command,
+    AppConfig, ChangeSet, CommitFix, CommitOptions, DEFAULT_MAX_FILE_CHARS,
+    DEFAULT_MAX_INPUT_CHARS, DEFAULT_STAGED_DIFF_COMMAND, DEFAULT_UNSTAGED_DIFF_COMMAND,
+    DEFAULT_UNTRACKED_DIFF_COMMAND, DiffPreparationReport, IncludeUnstagedMode, build_commit_args,
+    collect_changes, detect_commit_fix, run_shell_command,
 };
 use std::fs;
 use std::process::Command;
@@ -61,6 +62,10 @@ fn sample_config(include_unstaged: IncludeUnstagedMode) -> AppConfig {
         unstaged_files_command: "git diff --name-only".to_string(),
         untracked_files_command: "git ls-files --others --exclude-standard".to_string(),
         include_unstaged,
+        max_input_chars: DEFAULT_MAX_INPUT_CHARS,
+        max_file_chars: DEFAULT_MAX_FILE_CHARS,
+        include_lockfiles: false,
+        ignore_diff_paths: Vec::new(),
         temperature: 0.2,
         max_tokens: 512,
         timeout_seconds: 120,
@@ -167,6 +172,7 @@ fn change_set_reports_extra_paths_only_when_included() {
         diff: "diff".to_string(),
         included_unstaged_paths: vec!["tracked.txt".to_string()],
         included_untracked_paths: Vec::new(),
+        diff_report: DiffPreparationReport::default(),
     };
 
     assert_eq!(changes.included_unstaged_paths, vec!["tracked.txt"]);
