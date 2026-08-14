@@ -54,6 +54,7 @@ fn sample_config(include_unstaged: IncludeUnstagedMode) -> AppConfig {
         base_url: "http://127.0.0.1:3002".to_string(),
         endpoint: "/v1/chat/completions".to_string(),
         model: "model".to_string(),
+        effort: None,
         prompt: "prompt".to_string(),
         diff_command: DEFAULT_STAGED_DIFF_COMMAND.to_string(),
         staged_diff_command: DEFAULT_STAGED_DIFF_COMMAND.to_string(),

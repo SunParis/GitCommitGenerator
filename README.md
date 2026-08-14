@@ -38,6 +38,7 @@ api_key = "sk-..."
 base_url = "http://127.0.0.1:3002"
 endpoint = "/v1/chat/completions"
 model = "gpt-5.4"
+effort = "high"
 temperature = 0.2
 max_tokens = 512
 timeout_seconds = 120
@@ -85,6 +86,14 @@ args = ["--trailer Reviewed-by=QA"]
 `http://127.0.0.1:3002/v1`; the tool avoids duplicating path segments when
 joining it with `endpoint`.
 
+`effort` is sent to the API as `reasoning_effort`. Supported values are `none`,
+`minimal`, `low`, `medium`, `high`, `xhigh`, and `max` (case-insensitive). An
+invalid value prints a warning and omits the request field. If an API responds
+with `400` or `422` and explicitly reports that reasoning effort is invalid or
+unsupported, the tool prints a warning and retries once without the field.
+The command-line value takes precedence over `GCG_EFFORT`, which takes
+precedence over the TOML value.
+
 Diff input controls:
 
 | Config key | CLI option | Default | Description |
@@ -105,6 +114,7 @@ export GCG_API_KEY="sk-..."
 export GCG_MODEL="gpt-5.4"
 export GCG_BASE_URL="http://127.0.0.1:3002"
 export GCG_ENDPOINT="/v1/chat/completions"
+export GCG_EFFORT="high"
 export GCG_CONFIG="$HOME/.config/gitcommitgenerator/config.toml"
 export GCG_MAX_INPUT_CHARS="500000"
 export GCG_MAX_FILE_CHARS="80000"
@@ -124,6 +134,7 @@ Common options:
 gitcommitgenerator \
   --base-url http://127.0.0.1:3002 \
   --model gpt-5.4 \
+  --effort high \
   --api-key "$GCG_API_KEY" \
   --signoff \
   --no-verify
@@ -313,6 +324,18 @@ an empty commit message, or unstaged changes while automatic staging is disabled
 the tool asks whether to retry with the appropriate fix.
 
 ## Development
+
+Source modules are grouped by capability:
+
+- `app`: top-level workflow orchestration
+- `cli` and `config`: external inputs and resolved configuration
+- `changes` and `diff`: Git change selection and LLM input preparation
+- `git`: command execution
+- `llm`: OpenAI-compatible requests and responses
+- `commit`: commit arguments and recoverable retries
+
+The crate root remains a compatibility facade for the existing public Rust
+interface.
 
 ```bash
 cargo fmt
